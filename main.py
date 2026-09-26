@@ -11,12 +11,13 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -28,26 +29,33 @@ from aiogram.types import (
 )
 
 # ---------------------------------------------------------------------------
-# 1. КОНФИГУРАЦИЯ
+# 1. КОНФИГУРАЦИЯ И ТОКЕНЫ
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8968626105:AAFKGmGeQE0WZZsOy_44g9BxqymAGWf2Lho")
+CLIENT_BOT_TOKEN = os.getenv("BOT_TOKEN", "8968626105:AAFKGmGeQE0WZZsOy_44g9BxqymAGWf2Lho")
+ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "8669663581:AAFrwpkjedduLz1G4XjhKHrXcXpYVkP0FqY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6450299048"))
-PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "")  # Токен ЮKassa/Stripe из BotFather
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "")
 
-# Гарантируем корректный путь к файлу БД
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "shop.db")
+PHOTOS_DIR = os.path.join(BASE_DIR, "photos")
+
+os.makedirs(PHOTOS_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
+# Инициализация двух ботов
+client_bot = Bot(token=CLIENT_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+admin_bot = Bot(token=ADMIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
 # ---------------------------------------------------------------------------
-# DUMMY WEB SERVER (HEALTH CHECK FOR RENDER WEB SERVICE)
+# DUMMY WEB SERVER (HEALTH CHECK FOR RENDER)
 # ---------------------------------------------------------------------------
 async def handle_health_check(request):
-    return web.Response(text="Liyodora Bot is running successfully!")
+    return web.Response(text="Liyodora Dual-Bot System is running!")
 
 async def start_health_check_server():
     app = web.Application()
@@ -60,7 +68,7 @@ async def start_health_check_server():
     logger.info(f"Health check server running on port {port}")
 
 # ---------------------------------------------------------------------------
-# 2. БАЗА ДАННЫХ (aiosqlite)
+# 2. БАЗА ДАННЫХ
 # ---------------------------------------------------------------------------
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -72,7 +80,7 @@ async def init_db():
                 description TEXT,
                 price INTEGER NOT NULL,
                 sizes TEXT NOT NULL,
-                photo_id TEXT NOT NULL
+                photo_path TEXT NOT NULL
             )
         """)
         await db.execute("""
@@ -110,12 +118,12 @@ async def get_all_products():
         cursor = await db.execute("SELECT * FROM products ORDER BY id DESC")
         return await cursor.fetchall()
 
-async def add_product(code: str, title: str, desc: str, price: int, sizes: str, photo_id: str):
+async def add_product(code: str, title: str, desc: str, price: int, sizes: str, photo_path: str):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
-            INSERT INTO products (code_word, title, description, price, sizes, photo_id)
+            INSERT INTO products (code_word, title, description, price, sizes, photo_path)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (code.strip().lower(), title, desc, price, sizes, photo_id))
+        """, (code.strip().lower(), title, desc, price, sizes, photo_path))
         await db.commit()
 
 async def delete_product(product_id: int):
@@ -198,16 +206,16 @@ def phone_request_keyboard():
         one_time_keyboard=True
     )
 
-# ---------------------------------------------------------------------------
-# 5. ХЕНДЛЕРЫ КЛИЕНТА
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 5. КЛИЕНТСКИЙ БОТ (ТОЛЬКО ПОКУПАТЕЛИ)
+# ===========================================================================
 client_router = Router()
 
 @client_router.message(Command("cancel"))
 @client_router.callback_query(F.data == "cancel_action")
 async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
     await state.clear()
-    msg_text = "🔄 Действие отменено. Напишите /start, чтобы начать заново или введите кодовое слово:"
+    msg_text = "🔄 Действие отменено. Напишите /start, чтобы заново ввести кодовое слово:"
     if isinstance(event, CallbackQuery):
         await event.message.answer(msg_text, reply_markup=ReplyKeyboardRemove())
         await event.answer()
@@ -232,7 +240,7 @@ async def process_code_search(message: Message, state: FSMContext):
     if not product:
         await message.answer(
             f"❌ Товар по кодовому слову «<b>{code}</b>» не найден.\n"
-            "Пожалуйста, проверьте правильность написания и попробуйте еще раз:"
+            "Пожалуйста, проверьте написание и попробуйте еще раз:"
         )
         return
 
@@ -244,8 +252,9 @@ async def process_code_search(message: Message, state: FSMContext):
     )
     keyboard = product_sizes_keyboard(product['id'], product['sizes'])
 
-    if product['photo_id']:
-        await message.answer_photo(photo=product['photo_id'], caption=caption, reply_markup=keyboard)
+    if product['photo_path'] and os.path.exists(product['photo_path']):
+        photo_file = FSInputFile(product['photo_path'])
+        await message.answer_photo(photo=photo_file, caption=caption, reply_markup=keyboard)
     else:
         await message.answer(text=caption, reply_markup=keyboard)
 
@@ -293,7 +302,7 @@ async def process_phone(message: Message, state: FSMContext):
     )
 
 @client_router.message(OrderFSM.waiting_for_address, F.text)
-async def process_address(message: Message, state: FSMContext, bot: Bot):
+async def process_address(message: Message, state: FSMContext):
     address = message.text.strip()
     await state.update_data(address=address)
     data = await state.get_data()
@@ -314,7 +323,7 @@ async def process_address(message: Message, state: FSMContext, bot: Bot):
 
     if PAYMENT_TOKEN:
         await message.answer(summary + "💳 Нажмите кнопку ниже для безопасной онлайн-оплаты:")
-        await bot.send_invoice(
+        await client_bot.send_invoice(
             chat_id=message.chat.id,
             title=f"Оплата: {title}",
             description=f"Размер: {size}, Доставка: {address}",
@@ -340,19 +349,24 @@ async def process_address(message: Message, state: FSMContext, bot: Bot):
             "🎉 <b>Заказ успешно оформлен!</b>\n"
             "Наш менеджер свяжется с вами для подтверждения доставки."
         )
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"🚨 <b>Новый заказ #{order_id}!</b>\n\n"
-                f"👤 Клиент: {data['full_name']} (@{message.from_user.username or 'нет'})\n"
-                f"📞 Телефон: {data['phone']}\n"
-                f"📍 Адрес: {address}\n"
-                f"👗 Товар: {title} (ID: {data['product_id']})\n"
-                f"📏 Размер: {size}\n"
-                f"💰 Сумма: {price} руб."
-            ),
-            reply_markup=admin_order_actions_keyboard(order_id)
-        )
+        # Отправка уведомления АДМИНУ через АДМИНСКИЙ БОТ
+        try:
+            await admin_bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🚨 <b>Новый заказ #{order_id}!</b>\n\n"
+                    f"👤 Клиент: {data['full_name']} (@{message.from_user.username or 'нет'})\n"
+                    f"📞 Телефон: {data['phone']}\n"
+                    f"📍 Адрес: {address}\n"
+                    f"👗 Товар: {title} (ID: {data['product_id']})\n"
+                    f"📏 Размер: {size}\n"
+                    f"💰 Сумма: {price} руб."
+                ),
+                reply_markup=admin_order_actions_keyboard(order_id)
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение в админ-бот: {e}")
+
         await state.clear()
 
 @client_router.pre_checkout_query()
@@ -360,7 +374,7 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
     await pre_checkout_query.answer(ok=True)
 
 @client_router.message(F.successful_payment)
-async def process_successful_payment(message: Message, state: FSMContext, bot: Bot):
+async def process_successful_payment(message: Message, state: FSMContext):
     data = await state.get_data()
     amount = message.successful_payment.total_amount // 100
 
@@ -381,37 +395,44 @@ async def process_successful_payment(message: Message, state: FSMContext, bot: B
         "Ваш товар уже готовится к отправке. Спасибо за покупку в Liyodora!"
     )
 
-    await bot.send_message(
-        chat_id=ADMIN_ID,
-        text=(
-            f"💰 <b>ОПЛАЧЕН НОВЫЙ ЗАКАЗ #{order_id}!</b>\n\n"
-            f"👤 Покупатель: {data.get('full_name')} (@{message.from_user.username or 'нет'})\n"
-            f"📞 Телефон: {data.get('phone')}\n"
-            f"📍 Адрес доставки: {data.get('address')}\n"
-            f"👗 Товар: {data.get('title')} (Размер: {data.get('size')})\n"
-            f"💳 Оплачено: {amount} руб."
-        ),
-        reply_markup=admin_order_actions_keyboard(order_id)
-    )
+    # Уведомление в Админский бот
+    try:
+        await admin_bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"💰 <b>ОПЛАЧЕН НОВЫЙ ЗАКАЗ #{order_id}!</b>\n\n"
+                f"👤 Покупатель: {data.get('full_name')} (@{message.from_user.username or 'нет'})\n"
+                f"📞 Телефон: {data.get('phone')}\n"
+                f"📍 Адрес доставки: {data.get('address')}\n"
+                f"👗 Товар: {data.get('title')} (Размер: {data.get('size')})\n"
+                f"💳 Оплачено: {amount} руб."
+            ),
+            reply_markup=admin_order_actions_keyboard(order_id)
+        )
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
+
     await state.clear()
 
-# ---------------------------------------------------------------------------
-# 6. ХЕНДЛЕРЫ АДМИНИСТРАТОРА
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 6. АДМИНСКИЙ БОТ (ТОЛЬКО ДЛЯ АДМИНИСТРАТОРА)
+# ===========================================================================
 admin_router = Router()
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
+@admin_router.message(CommandStart())
 @admin_router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext):
+async def cmd_admin_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен. Это закрытый бот администратора.")
         return
     await state.clear()
-    await message.answer("👑 <b>Панель администратора Liyodora</b>", reply_markup=admin_menu_keyboard())
+    await message.answer("👑 <b>Панель управления Liyodora Admin</b>", reply_markup=admin_menu_keyboard())
 
 @admin_router.callback_query(F.data.startswith("order_status:"))
-async def on_change_order_status(callback: CallbackQuery, bot: Bot):
+async def on_change_order_status(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
 
@@ -432,11 +453,11 @@ async def on_change_order_status(callback: CallbackQuery, bot: Bot):
         status_text = "❌ <b>Отменен</b>"
         client_msg = f"❌ Ваш заказ <b>#{order_id}</b> был отменен. Наш менеджер свяжется с вами."
 
-    # Отправляем уведомление покупателю
+    # Отправляем сообщение покупателю ЧЕРЕЗ КЛИЕНТСКИЙ БОТ
     try:
-        await bot.send_message(chat_id=order['user_id'], text=client_msg)
+        await client_bot.send_message(chat_id=order['user_id'], text=client_msg)
     except Exception as e:
-        logger.error(f"Не удалось отправить уведомление клиенту: {e}")
+        logger.error(f"Не удалось отправить статус клиенту: {e}")
 
     await callback.message.edit_text(
         callback.message.text + f"\n\nСтатус заказа изменен на: {status_text}"
@@ -449,62 +470,81 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminAddProductFSM.waiting_for_code)
     await callback.message.answer(
-        "Шаг 1/6: Введите <b>кодовое слово</b> (пароль из Reels/Stories, например: <code>dress01</code>):",
+        "Шаг 1/6: Введите <b>кодовое слово</b> (пароль из Reels, например: <code>dress01</code>):",
         reply_markup=cancel_keyboard()
     )
     await callback.answer()
 
 @admin_router.message(AdminAddProductFSM.waiting_for_code, F.text)
 async def add_product_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     await state.update_data(code=message.text.strip().lower())
     await state.set_state(AdminAddProductFSM.waiting_for_title)
     await message.answer("Шаг 2/6: Введите <b>название товара</b>:", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_title, F.text)
 async def add_product_title(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     await state.update_data(title=message.text.strip())
     await state.set_state(AdminAddProductFSM.waiting_for_desc)
     await message.answer("Шаг 3/6: Введите <b>описание товара</b>:", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_desc, F.text)
 async def add_product_desc(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     await state.update_data(desc=message.text.strip())
     await state.set_state(AdminAddProductFSM.waiting_for_price)
-    await message.answer("Шаг 4/6: Введите <b>цену</b> в рублях (целое число, например: <code>3500</code>):", reply_markup=cancel_keyboard())
+    await message.answer("Шаг 4/6: Введите <b>цену</b> в рублях (целое число):", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_price, F.text)
 async def add_product_price(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     try:
         price = int(message.text.strip())
     except ValueError:
-        await message.answer("Пожалуйста, введите корректное число для цены:")
+        await message.answer("Пожалуйста, введите число:")
         return
     await state.update_data(price=price)
     await state.set_state(AdminAddProductFSM.waiting_for_sizes)
-    await message.answer("Шаг 5/6: Введите <b>доступные размеры через запятую</b> (например: <code>XS, S, M, L</code>):", reply_markup=cancel_keyboard())
+    await message.answer("Шаг 5/6: Введите <b>размеры через запятую</b> (например: <code>S, M, L</code>):", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_sizes, F.text)
 async def add_product_sizes(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
     await state.update_data(sizes=message.text.strip())
     await state.set_state(AdminAddProductFSM.waiting_for_photo)
     await message.answer("Шаг 6/6: Отправьте <b>фотографию товара</b>:", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_photo, F.photo)
 async def add_product_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
+    if not is_admin(message.from_user.id):
+        return
     data = await state.get_data()
+    code = data['code']
+
+    # Скачиваем фото локально, чтобы оба бота могли его показывать
+    photo = message.photo[-1]
+    file_info = await admin_bot.get_file(photo.file_id)
+    photo_path = os.path.join(PHOTOS_DIR, f"{code}.jpg")
+    await admin_bot.download_file(file_info.file_path, photo_path)
 
     await add_product(
-        code=data['code'],
+        code=code,
         title=data['title'],
         desc=data['desc'],
         price=data['price'],
         sizes=data['sizes'],
-        photo_id=photo_id
+        photo_path=photo_path
     )
+
     await message.answer(
         f"✅ <b>Товар успешно добавлен!</b>\n\n"
-        f"• Кодовое слово: <code>{data['code']}</code>\n"
+        f"• Кодовое слово: <code>{code}</code>\n"
         f"• Название: {data['title']}\n"
         f"• Цена: {data['price']} руб.\n"
         f"• Размеры: {data['sizes']}",
@@ -530,8 +570,9 @@ async def list_products(callback: CallbackQuery):
             f"🏷 <b>{p['title']}</b> (Код: <code>{p['code_word']}</code>)\n"
             f"Цена: {p['price']} руб. | Размеры: {p['sizes']}"
         )
-        if p['photo_id']:
-            await callback.message.answer_photo(photo=p['photo_id'], caption=text, reply_markup=kb)
+        if p['photo_path'] and os.path.exists(p['photo_path']):
+            photo_file = FSInputFile(p['photo_path'])
+            await callback.message.answer_photo(photo=photo_file, caption=text, reply_markup=kb)
         else:
             await callback.message.answer(text=text, reply_markup=kb)
 
@@ -542,31 +583,46 @@ async def on_delete_product(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     product_id = int(callback.data.split(":")[1])
+    
+    # Удаляем запись
+    product = await get_product_by_id(product_id)
+    if product and product['photo_path'] and os.path.exists(product['photo_path']):
+        try:
+            os.remove(product['photo_path'])
+        except Exception as e:
+            logger.error(f"Ошибка удаления файла фото: {e}")
+
     await delete_product(product_id)
     await callback.message.answer("🗑 Товар удален.", reply_markup=admin_menu_keyboard())
     await callback.answer()
 
 # ---------------------------------------------------------------------------
-# 7. ГЛАВНАЯ ТОЧКА ВХОДА
+# 7. ГЛАВНАЯ ТОЧКА ВХОДА (ЗАПУСК ОБОИХ БОТОВ)
 # ---------------------------------------------------------------------------
 async def main():
     await init_db()
-    
-    # Запускаем фоновый веб-сервер для проходимости проверки Render
     await start_health_check_server()
 
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    # Диспетчеры
+    client_dp = Dispatcher(storage=MemoryStorage())
+    admin_dp = Dispatcher(storage=MemoryStorage())
 
-    dp.include_router(admin_router)
-    dp.include_router(client_router)
+    client_dp.include_router(client_router)
+    admin_dp.include_router(admin_router)
 
-    logger.info("Бот Liyodora запускается...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await client_bot.delete_webhook(drop_pending_updates=True)
+    await admin_bot.delete_webhook(drop_pending_updates=True)
+
+    logger.info("Запуск системы из 2 ботов (Клиентский + Админский)...")
+
+    # Одновременный запуск двух ботов
+    await asyncio.gather(
+        client_dp.start_polling(client_bot),
+        admin_dp.start_polling(admin_bot)
+    )
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
+        logger.info("Боты остановлены.")
