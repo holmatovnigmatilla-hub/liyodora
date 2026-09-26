@@ -34,8 +34,11 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8968626105:AAFKGmGeQE0WZZsOy_44g9BxqymAGWf2Lho")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6450299048"))
-PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "")  # Токен ЮKassa/Stripe из BotFather (для боевых оплат)
-DB_NAME = "shop.db"
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "")  # Токен ЮKassa/Stripe из BotFather
+
+# Гарантируем корректный путь к файлу БД
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_NAME = os.path.join(BASE_DIR, "shop.db")
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
@@ -129,6 +132,17 @@ async def create_order(user_id: int, username: str, full_name: str, phone: str, 
         await db.commit()
         return cursor.lastrowid
 
+async def update_order_status(order_id: int, status: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+        await db.commit()
+
+async def get_order_by_id(order_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+        return await cursor.fetchone()
+
 # ---------------------------------------------------------------------------
 # 3. FSM СОСТОЯНИЯ
 # ---------------------------------------------------------------------------
@@ -149,10 +163,23 @@ class AdminAddProductFSM(StatesGroup):
 # ---------------------------------------------------------------------------
 # 4. КЛАВИАТУРЫ
 # ---------------------------------------------------------------------------
+def cancel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+    ])
+
 def admin_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
         [InlineKeyboardButton(text="📋 Список товаров", callback_data="admin_list_products")],
+    ])
+
+def admin_order_actions_keyboard(order_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚚 Отправлен", callback_data=f"order_status:{order_id}:SHIPPED"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"order_status:{order_id}:CANCELLED")
+        ]
     ])
 
 def product_sizes_keyboard(product_id: int, sizes_str: str):
@@ -175,6 +202,17 @@ def phone_request_keyboard():
 # 5. ХЕНДЛЕРЫ КЛИЕНТА
 # ---------------------------------------------------------------------------
 client_router = Router()
+
+@client_router.message(Command("cancel"))
+@client_router.callback_query(F.data == "cancel_action")
+async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
+    await state.clear()
+    msg_text = "🔄 Действие отменено. Напишите /start, чтобы начать заново или введите кодовое слово:"
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(msg_text, reply_markup=ReplyKeyboardRemove())
+        await event.answer()
+    else:
+        await event.answer(msg_text, reply_markup=ReplyKeyboardRemove())
 
 @client_router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -226,7 +264,8 @@ async def on_size_selected(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         f"✅ Вы выбрали: <b>{product['title']}</b> (Размер: <b>{size}</b>)\n\n"
-        "Для оформления доставки введите ваши <b>Фамилию и Имя</b> получателя:"
+        "Для оформления доставки введите ваши <b>Фамилию и Имя</b> получателя:",
+        reply_markup=cancel_keyboard()
     )
     await callback.answer()
 
@@ -250,7 +289,7 @@ async def process_phone(message: Message, state: FSMContext):
     await state.set_state(OrderFSM.waiting_for_address)
     await message.answer(
         "📍 Введите <b>адрес доставки</b> или удобный <b>пункт выдачи (СДЭК, Яндекс Маркет, Почта)</b>:",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=cancel_keyboard()
     )
 
 @client_router.message(OrderFSM.waiting_for_address, F.text)
@@ -311,7 +350,8 @@ async def process_address(message: Message, state: FSMContext, bot: Bot):
                 f"👗 Товар: {title} (ID: {data['product_id']})\n"
                 f"📏 Размер: {size}\n"
                 f"💰 Сумма: {price} руб."
-            )
+            ),
+            reply_markup=admin_order_actions_keyboard(order_id)
         )
         await state.clear()
 
@@ -350,7 +390,8 @@ async def process_successful_payment(message: Message, state: FSMContext, bot: B
             f"📍 Адрес доставки: {data.get('address')}\n"
             f"👗 Товар: {data.get('title')} (Размер: {data.get('size')})\n"
             f"💳 Оплачено: {amount} руб."
-        )
+        ),
+        reply_markup=admin_order_actions_keyboard(order_id)
     )
     await state.clear()
 
@@ -369,13 +410,47 @@ async def cmd_admin(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("👑 <b>Панель администратора Liyodora</b>", reply_markup=admin_menu_keyboard())
 
+@admin_router.callback_query(F.data.startswith("order_status:"))
+async def on_change_order_status(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user.id):
+        return
+
+    _, order_id_str, status = callback.data.split(":")
+    order_id = int(order_id_str)
+    
+    order = await get_order_by_id(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    await update_order_status(order_id, status)
+
+    if status == "SHIPPED":
+        status_text = "🚚 <b>Отправлен</b>"
+        client_msg = f"🚚 Ваш заказ <b>#{order_id}</b> успешно отправлен! Ожидайте прибытия."
+    else:
+        status_text = "❌ <b>Отменен</b>"
+        client_msg = f"❌ Ваш заказ <b>#{order_id}</b> был отменен. Наш менеджер свяжется с вами."
+
+    # Отправляем уведомление покупателю
+    try:
+        await bot.send_message(chat_id=order['user_id'], text=client_msg)
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление клиенту: {e}")
+
+    await callback.message.edit_text(
+        callback.message.text + f"\n\nСтатус заказа изменен на: {status_text}"
+    )
+    await callback.answer("Статус обновлен!")
+
 @admin_router.callback_query(F.data == "admin_add_product")
 async def start_add_product(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await state.set_state(AdminAddProductFSM.waiting_for_code)
     await callback.message.answer(
-        "Шаг 1/6: Введите <b>кодовое слово</b> (пароль из Reels/Stories, например: <code>dress01</code>):"
+        "Шаг 1/6: Введите <b>кодовое слово</b> (пароль из Reels/Stories, например: <code>dress01</code>):",
+        reply_markup=cancel_keyboard()
     )
     await callback.answer()
 
@@ -383,19 +458,19 @@ async def start_add_product(callback: CallbackQuery, state: FSMContext):
 async def add_product_code(message: Message, state: FSMContext):
     await state.update_data(code=message.text.strip().lower())
     await state.set_state(AdminAddProductFSM.waiting_for_title)
-    await message.answer("Шаг 2/6: Введите <b>название товара</b>:")
+    await message.answer("Шаг 2/6: Введите <b>название товара</b>:", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_title, F.text)
 async def add_product_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     await state.set_state(AdminAddProductFSM.waiting_for_desc)
-    await message.answer("Шаг 3/6: Введите <b>описание товара</b>:")
+    await message.answer("Шаг 3/6: Введите <b>описание товара</b>:", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_desc, F.text)
 async def add_product_desc(message: Message, state: FSMContext):
     await state.update_data(desc=message.text.strip())
     await state.set_state(AdminAddProductFSM.waiting_for_price)
-    await message.answer("Шаг 4/6: Введите <b>цену</b> в рублях (целое число, например: <code>3500</code>):")
+    await message.answer("Шаг 4/6: Введите <b>цену</b> в рублях (целое число, например: <code>3500</code>):", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_price, F.text)
 async def add_product_price(message: Message, state: FSMContext):
@@ -406,13 +481,13 @@ async def add_product_price(message: Message, state: FSMContext):
         return
     await state.update_data(price=price)
     await state.set_state(AdminAddProductFSM.waiting_for_sizes)
-    await message.answer("Шаг 5/6: Введите <b>доступные размеры через запятую</b> (например: <code>XS, S, M, L</code>):")
+    await message.answer("Шаг 5/6: Введите <b>доступные размеры через запятую</b> (например: <code>XS, S, M, L</code>):", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_sizes, F.text)
 async def add_product_sizes(message: Message, state: FSMContext):
     await state.update_data(sizes=message.text.strip())
     await state.set_state(AdminAddProductFSM.waiting_for_photo)
-    await message.answer("Шаг 6/6: Отправьте <b>фотографию товара</b>:")
+    await message.answer("Шаг 6/6: Отправьте <b>фотографию товара</b>:", reply_markup=cancel_keyboard())
 
 @admin_router.message(AdminAddProductFSM.waiting_for_photo, F.photo)
 async def add_product_photo(message: Message, state: FSMContext):
