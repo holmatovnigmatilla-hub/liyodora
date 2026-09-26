@@ -5,6 +5,7 @@ import sys
 from datetime import datetime
 
 import aiosqlite
+from aiohttp import web
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -38,6 +39,22 @@ DB_NAME = "shop.db"
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# DUMMY WEB SERVER (HEALTH CHECK FOR RENDER WEB SERVICE)
+# ---------------------------------------------------------------------------
+async def handle_health_check(request):
+    return web.Response(text="Liyodora Bot is running successfully!")
+
+async def start_health_check_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check server running on port {port}")
 
 # ---------------------------------------------------------------------------
 # 2. БАЗА ДАННЫХ (aiosqlite)
@@ -144,7 +161,6 @@ def product_sizes_keyboard(product_id: int, sizes_str: str):
         InlineKeyboardButton(text=f"Размер {size}", callback_data=f"buy:{product_id}:{size}")
         for size in sizes
     ]
-    # Размещаем по 2 кнопки в ряд
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -270,7 +286,6 @@ async def process_address(message: Message, state: FSMContext, bot: Bot):
             start_parameter="pay-order"
         )
     else:
-        # Режим без внешнего платежного шлюза / демо-заказ
         order_id = await create_order(
             user_id=message.from_user.id,
             username=message.from_user.username or "",
@@ -286,7 +301,6 @@ async def process_address(message: Message, state: FSMContext, bot: Bot):
             "🎉 <b>Заказ успешно оформлен!</b>\n"
             "Наш менеджер свяжется с вами для подтверждения доставки."
         )
-        # Оповещение администратора
         await bot.send_message(
             chat_id=ADMIN_ID,
             text=(
@@ -462,6 +476,10 @@ async def on_delete_product(callback: CallbackQuery):
 # ---------------------------------------------------------------------------
 async def main():
     await init_db()
+    
+    # Запускаем фоновый веб-сервер для проходимости проверки Render
+    await start_health_check_server()
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
