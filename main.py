@@ -577,7 +577,7 @@ async def process_address(message: Message, state: FSMContext):
     await track(state, message.message_id)
     address = message.text.strip()
     data = await state.get_data()
-        price, title, size = data['price'], data['title'], data['size']
+    price, title, size = data['price'], data['title'], data['size']
 
     order_id = await create_order(
         user_id=message.from_user.id,
@@ -665,10 +665,6 @@ async def client_fallback(message: Message, state: FSMContext):
 # ===========================================================================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
 
 
 @admin_router.message(F.text == BTN_CANCEL)
