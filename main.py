@@ -33,7 +33,7 @@ load_dotenv()
 
 CLIENT_BOT_TOKEN = os.getenv("BOT_TOKEN", "8968626105:AAFKGmGeQE0WZZsOy_44g9BxqymAGWf2Lho")
 ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "8669663581:AAFrwpkjedduLz1G4XjhKHrXcXpYVkP0FqY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "6450299048"))
+ADMIN_IDS = [6450299048, 8914196755]
 PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "")
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "liyodora_admin")
 
@@ -577,29 +577,7 @@ async def process_address(message: Message, state: FSMContext):
     await track(state, message.message_id)
     address = message.text.strip()
     data = await state.get_data()
-    price, title, size = data['price'], data['title'], data['size']
-
-    summary = (
-        f"🛍 <b>Подтверждение заказа</b>\n\n"
-        f"• Товар: <b>{title}</b>\n• Размер: <b>{size}</b>\n"
-        f"• Получатель: <b>{data['full_name']}</b>\n• Телефон: <b>{data['phone']}</b>\n"
-        f"• Доставка: <b>{address} (Узбекистан)</b>\n• Итого: <b>{price:,} сум</b>\n\n"
-    )
-
-    if PAYMENT_TOKEN:
-        msg = await message.answer(summary + "💳 Нажмите кнопку ниже для оплаты:", reply_markup=client_menu())
-        await track(state, msg.message_id)
-        await client_bot.send_invoice(
-            chat_id=message.chat.id,
-            title=f"Оплата: {title}",
-            description=f"Размер: {size}, Доставка: {address}",
-            payload=f"order_{data['product_id']}_{size}",
-            provider_token=PAYMENT_TOKEN,
-            currency="UZS",
-            prices=[LabeledPrice(label=f"{title} ({size})", amount=int(price * 100))],
-            start_parameter="pay-order",
-        )
-        return
+        price, title, size = data['price'], data['title'], data['size']
 
     order_id = await create_order(
         user_id=message.from_user.id,
@@ -611,23 +589,57 @@ async def process_address(message: Message, state: FSMContext):
         size=size,
         amount=price,
     )
-    await message.answer(
-        summary + "🎉 <b>Заказ оформлен!</b>\nМенеджер свяжется с вами для подтверждения доставки.",
-        reply_markup=client_menu(),
+
+    # Сообщение клиенту с реквизитами для перевода
+    payment_info = (
+        f"🛍 <b>Заказ #{order_id} успешно оформлен!</b>\n\n"
+        f"• Товар: <b>{title}</b>\n"
+        f"• Размер: <b>{size}</b>\n"
+        f"• Получатель: <b>{data['full_name']}</b>\n"
+        f"• Телефон: <b>{data['phone']}</b>\n"
+        f"• Адрес: <b>{address}</b>\n"
+        f"• К оплате: <b>{price:,} сум</b>\n\n"
+        f"💳 <b>Реквизиты для оплаты (Click / Payme):</b>\n"
+        f"Номер карты (нажмите, чтобы скопировать):\n"
+        f"<code>5614681852563877</code>\n"
+        f"Получатель: <b>Mahliyo Burxanova</b>\n\n"
+        f"⚠️ <i>После перевода отправьте скриншот чека: @{MANAGER_USERNAME}</i>"
     )
-    try:
-        await admin_bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"🚨 <b>Новый заказ #{order_id}!</b>\n\n"
-                f"👤 Клиент: {data['full_name']} (@{message.from_user.username or 'нет'})\n"
-                f"📞 Телефон: {data['phone']}\n📍 Адрес: {address}\n"
-                f"👗 Товар: {title}\n📏 Размер: {size}\n💰 Сумма: {price:,} сум"
-            ),
-            reply_markup=admin_order_actions_keyboard(order_id),
-        )
-    except Exception as e:
-        logger.error(f"Не удалось отправить сообщение в админ-бот: {e}")
+
+    check_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧾 Отправить чек менеджеру",
+                    url=f"https://t.me/{MANAGER_USERNAME}",
+                )
+            ]
+        ]
+    )
+
+    await message.answer(payment_info, reply_markup=check_kb)
+    await message.answer("Вы можете продолжить покупки в меню ниже 👇", reply_markup=client_menu())
+
+    # Оповещение обоим администраторам
+    order_notification = (
+        f"🚨 <b>Новый заказ #{order_id}! (Ожидает оплаты)</b>\n\n"
+        f"👤 Клиент: {data['full_name']} (@{message.from_user.username or 'нет'})\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"📍 Адрес: {address}\n"
+        f"👗 Товар: {title}\n"
+        f"📏 Размер: {size}\n"
+        f"💰 Сумма: {price:,} сум"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await admin_bot.send_message(
+                chat_id=admin_id,
+                text=order_notification,
+                reply_markup=admin_order_actions_keyboard(order_id),
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
     await state.clear()
 
@@ -651,7 +663,8 @@ async def client_fallback(message: Message, state: FSMContext):
 # ===========================================================================
 # 8. АДМИН-БОТ
 # ===========================================================================
-admin_router = Router()
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def is_admin(user_id: int) -> bool:
